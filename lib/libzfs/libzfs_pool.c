@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <zone.h>
+#include <linux/blkpg.h>
 #include <sys/stat.h>
 #include <sys/efi_partition.h>
 #include <sys/systeminfo.h>
@@ -2854,6 +2855,98 @@ zpool_relabel_disk(libzfs_handle_t *hdl, const char *path, const char *msg)
 	return (0);
 }
 
+static int call_blkpg_ioctl(int fd, int command, diskaddr_t start, diskaddr_t size, uint_t pno, char *path) {
+	struct blkpg_ioctl_arg ioctl_arg;
+	struct blkpg_partition  linux_part;
+	memset (&linux_part, 0, sizeof (linux_part));
+
+	linux_part.start = start;
+	linux_part.length = size;
+	linux_part.pno = pno;
+	strncpy(linux_part.devname, path, BLKPG_DEVNAMELTH-1);
+	linux_part.devname[BLKPG_DEVNAMELTH-1] = '\0';
+
+	ioctl_arg.op = command;
+	ioctl_arg.flags = 0;
+	ioctl_arg.datalen = sizeof (struct blkpg_partition);
+	ioctl_arg.data = &linux_part;
+
+	return ioctl(fd, BLKPG, &ioctl_arg);
+}
+
+static int
+zpool_expand_part(libzfs_handle_t *hdl, const char *path, const char *msg)
+{
+	int fd, error, i;
+	char part_path[MAXPATHLEN];
+	uint_t                  resv_index = 0, data_index = 0;
+	diskaddr_t              resv_start = 0, data_start = 0;
+	struct dk_gpt           *efi_label = NULL;
+
+	if ((fd = open(path, O_RDWR)) < 0) {
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "cannot "
+		    "expand part '%s': unable to open device: %d"), path, errno);
+		return (zfs_error(hdl, EZFS_OPENFAILED, msg));
+	}
+
+	error = efi_alloc_and_read(fd, &efi_label);
+	if (error < 0) {
+		(void) fprintf(stdout, "efi_alloc_and_read: got error %d\n", error);
+		if (efi_label != NULL)
+			efi_free(efi_label);
+		return (0);
+	}
+        /*
+         * Find the last physically non-zero partition.
+         * This should be the reserved partition.
+         */
+        for (i = 0; i < efi_label->efi_nparts; i ++) {
+                if (resv_start < efi_label->efi_parts[i].p_start) {
+                        resv_start = efi_label->efi_parts[i].p_start;
+                        resv_index = i;
+                }
+        }
+	(void) fprintf(stdout, "resv index: %d, resv_start %llu\n", resv_index, resv_start);
+
+        /*
+         * Find the last physically non-zero partition before that.
+         * This is the data partition.
+         */
+        for (i = 0; i < resv_index; i ++) {
+                if (data_start < efi_label->efi_parts[i].p_start) {
+                        data_start = efi_label->efi_parts[i].p_start;
+                        data_index = i;
+                }
+        }
+
+	/*
+	 * Delete the reserved partition
+	 */
+	error = call_blkpg_ioctl(fd, BLKPG_DEL_PARTITION, 0, 0, resv_index + 1, "");
+
+	/* append the partition information to the path */
+	(void) strlcpy(part_path, path, sizeof (part_path));
+	if (zfs_append_partition(part_path, MAXPATHLEN) < 0) {
+		(void) fprintf(stdout, "failed to append partition info to %s\n", path);
+		return (EINVAL);
+	}
+	/*
+	 * Expand the data partition
+	 */
+	diskaddr_t data_size = efi_label->efi_parts[data_index].p_size;
+	error = call_blkpg_ioctl(fd, BLKPG_RESIZE_PARTITION, data_start * 512, data_size * 512, data_index + 1, part_path);
+
+	/*
+	 * Re-add the reserved partition
+	 */
+	diskaddr_t resv_size = efi_label->efi_parts[resv_index].p_size;
+	error = call_blkpg_ioctl(fd, BLKPG_ADD_PARTITION, resv_start * 512, resv_size * 512, resv_index + 1, part_path);
+
+	(void) close(fd);
+	efi_free(efi_label);
+	return (error);
+}
+
 /*
  * Convert a vdev path to a GUID.  Returns GUID or 0 on error.
  *
@@ -2959,6 +3052,16 @@ zpool_vdev_online(zpool_handle_t *zhp, const char *path, int flags,
 			error = zpool_relabel_disk(hdl, fullpath, msg);
 			if (error != 0)
 				return (error);
+
+#ifdef BLKPG_RESIZE_PARTITION
+			(void) fprintf(stdout, "BLKPG_RESIZE_PARTITION available\n");
+			error = zpool_expand_part(hdl, fullpath, msg);
+			if (error != 0)
+				return (error);
+#else
+			(void) fprintf(stdout, "BLKPG_RESIZE_PARTITION not available\n");
+
+#endif
 		}
 	}
 
